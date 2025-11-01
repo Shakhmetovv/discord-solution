@@ -1,0 +1,152 @@
+(() => {
+    delete window.$;
+    let wpRequire = webpackChunkdiscord_app.push([[Symbol()], {}, r => r]);
+    webpackChunkdiscord_app.pop();
+
+    let ApplicationStreamingStore = Object.values(wpRequire.c).find(x => x?.exports?.Z?.__proto__?.getStreamerActiveStreamMetadata)?.exports?.Z;
+    let RunningGameStore = Object.values(wpRequire.c).find(x => x?.exports?.ZP?.getRunningGames)?.exports?.ZP;
+    let QuestsStore = Object.values(wpRequire.c).find(x => x?.exports?.Z?.__proto__?.getQuest)?.exports?.Z;
+    let ChannelStore = Object.values(wpRequire.c).find(x => x?.exports?.Z?.__proto__?.getAllThreadsForParent)?.exports?.Z;
+    let GuildChannelStore = Object.values(wpRequire.c).find(x => x?.exports?.ZP?.getSFWDefaultChannel)?.exports?.ZP;
+    let FluxDispatcher = Object.values(wpRequire.c).find(x => x?.exports?.Z?.__proto__?.flushWaitQueue)?.exports?.Z;
+    let api = Object.values(wpRequire.c).find(x => x?.exports?.tn?.get)?.exports?.tn;
+
+    let quest = [...QuestsStore.quests.values()].find(x =>
+        x.id !== "1248385850622869556" &&
+        x.userStatus?.enrolledAt &&
+        !x.userStatus?.completedAt &&
+        new Date(x.config.expiresAt).getTime() > Date.now()
+    );
+
+    if (!quest) return console.log("У тебя нет незавершённых квестов!");
+
+    const pid = Math.floor(Math.random() * 30000) + 1000;
+    const applicationId = quest.config.application?.id;
+    const applicationName = quest.config.application?.name;
+
+    const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
+    if (!taskConfig?.tasks) return console.error("Не найдены задачи в конфигурации квеста.");
+
+    const taskName = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY"].find(x => taskConfig.tasks[x]);
+    if (!taskName) return console.error("Нет подходящей задачи в конфигурации.");
+
+    const secondsNeeded = taskConfig.tasks[taskName].target;
+    let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+    const isApp = typeof DiscordNative !== "undefined";
+
+    if (taskName === "WATCH_VIDEO") {
+        const maxFuture = 10, speed = 7, interval = 1;
+        const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
+        (async () => {
+            while (true) {
+                const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
+                const diff = maxAllowed - secondsDone;
+                const timestamp = secondsDone + speed;
+                if (diff >= speed) {
+                    await api.post({
+                        url: `/quests/${quest.id}/video-progress`,
+                        body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) }
+                    });
+                    secondsDone = Math.min(secondsNeeded, timestamp);
+                }
+                if (timestamp >= secondsNeeded) break;
+                await new Promise(r => setTimeout(r, interval * 1000));
+            }
+            console.log("Квест завершён!");
+        })();
+        console.log(`Имитация просмотра видео для ${applicationName}.`);
+    }
+
+    else if (taskName === "PLAY_ON_DESKTOP") {
+        if (!isApp) return console.log("Этот тип квеста работает только в десктоп-приложении Discord.");
+
+        api.get({ url: `/applications/public?application_ids=${applicationId}` }).then(res => {
+            const appData = res.body?.[0];
+            if (!appData) return console.error("Не удалось получить данные приложения.");
+            const exeName = appData.executables.find(x => x.os === "win32")?.name?.replace(">", "");
+            if (!exeName) return console.error("Не найден исполняемый файл для Windows.");
+
+            const fakeGame = {
+                cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
+                exeName,
+                exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+                hidden: false,
+                isLauncher: false,
+                id: applicationId,
+                name: appData.name,
+                pid,
+                pidPath: [pid],
+                processName: appData.name,
+                start: Date.now(),
+            };
+
+            const realGames = RunningGameStore.getRunningGames();
+            const fakeGames = [fakeGame];
+            const realGetRunningGames = RunningGameStore.getRunningGames;
+            const realGetGameForPID = RunningGameStore.getGameForPID;
+            RunningGameStore.getRunningGames = () => fakeGames;
+            RunningGameStore.getGameForPID = pid => fakeGames.find(x => x.pid === pid);
+            FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: fakeGames });
+
+            const fn = data => {
+                const progress = quest.config.configVersion === 1
+                    ? data.userStatus.streamProgressSeconds
+                    : Math.floor(data.userStatus.progress.PLAY_ON_DESKTOP.value);
+                console.log(`Прогресс квеста: ${progress}/${secondsNeeded}`);
+                if (progress >= secondsNeeded) {
+                    console.log("Квест завершён!");
+                    RunningGameStore.getRunningGames = realGetRunningGames;
+                    RunningGameStore.getGameForPID = realGetGameForPID;
+                    FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: [] });
+                    FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                }
+            };
+            FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+            console.log(`Имитация запуска ${applicationName}. Осталось около ${Math.ceil((secondsNeeded - secondsDone) / 60)} минут.`);
+        });
+    }
+
+    else if (taskName === "STREAM_ON_DESKTOP") {
+        if (!isApp) return console.log("Этот тип квеста работает только в десктоп-приложении Discord.");
+
+        const realFunc = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
+        ApplicationStreamingStore.getStreamerActiveStreamMetadata = () => ({ id: applicationId, pid, sourceName: null });
+
+        const fn = data => {
+            const progress = quest.config.configVersion === 1
+                ? data.userStatus.streamProgressSeconds
+                : Math.floor(data.userStatus.progress.STREAM_ON_DESKTOP.value);
+            console.log(`Прогресс квеста: ${progress}/${secondsNeeded}`);
+            if (progress >= secondsNeeded) {
+                console.log("Квест завершён!");
+                ApplicationStreamingStore.getStreamerActiveStreamMetadata = realFunc;
+                FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+            }
+        };
+        FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+        console.log(`Имитация стрима ${applicationName}. Не забудь, хотя бы один человек должен быть в голосовом канале!`);
+    }
+
+    else if (taskName === "PLAY_ACTIVITY") {
+        const channelId =
+            ChannelStore.getSortedPrivateChannels()?.[0]?.id ??
+            Object.values(GuildChannelStore.getAllGuilds()).find(x => x?.VOCAL?.length > 0)?.VOCAL?.[0]?.channel?.id;
+        if (!channelId) return console.error("Не удалось найти голосовой канал.");
+
+        const streamKey = `call:${channelId}:1`;
+        (async () => {
+            console.log("Выполнение квеста", applicationName, "-", quest.config.messages.questName);
+            while (true) {
+                const res = await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: false } });
+                const progress = res.body?.progress?.PLAY_ACTIVITY?.value;
+                console.log(`Прогресс квеста: ${progress}/${secondsNeeded}`);
+                if (progress >= secondsNeeded) {
+                    await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: true } });
+                    break;
+                }
+                await new Promise(r => setTimeout(r, 20000));
+            }
+            console.log("Квест завершён!");
+        })();
+    }
+})();
