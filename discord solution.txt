@@ -17,6 +17,56 @@
     }
 
     const supportedTasks = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"];
+
+    function resolveApplicationId(quest, taskConfig, taskName) {
+        const c = quest.config || {};
+        const candidates = [
+            c.application?.id,
+            c.applicationId,
+            c.assets?.applicationId,
+            c.assets?.application_id,
+            c.messages?.applicationId,
+            taskConfig?.tasks?.[taskName]?.application?.id,
+            taskConfig?.tasks?.[taskName]?.applicationId,
+            taskConfig?.tasks?.[taskName]?.applications?.[0]?.id,
+            taskConfig?.tasks?.[taskName]?.applications?.[0],
+        ];
+        for (const v of candidates) {
+            if (v != null && v !== "") return String(v);
+        }
+        return null;
+    }
+
+    function resolveApplicationName(quest) {
+        const c = quest.config || {};
+        return (
+            c.application?.name ||
+            c.messages?.applicationName ||
+            c.messages?.questName ||
+            c.assets?.applicationName ||
+            "Unknown"
+        );
+    }
+
+    // Угадываем имя процесса, если executables пустой
+    function guessExeName(appData) {
+        const bases = [];
+        if (appData?.name) bases.push(appData.name);
+        if (Array.isArray(appData?.aliases)) bases.push(...appData.aliases);
+        if (Array.isArray(appData?.executables)) {
+            for (const e of appData.executables) {
+                if (e?.name) bases.push(e.name.replace(/^>/, ""));
+            }
+        }
+        for (const b of bases) {
+            if (!b) continue;
+            // Убираем всё кроме букв/цифр, добавляем .exe
+            const cleaned = String(b).replace(/[^a-zA-Z0-9]/g, "");
+            if (cleaned.length >= 2) return cleaned + ".exe";
+        }
+        return "game.exe";
+    }
+
     let quests = [...QuestsStore.quests.values()].filter(x => 
         x.userStatus?.enrolledAt && 
         !x.userStatus?.completedAt && 
@@ -35,13 +85,29 @@
         const quest = quests.pop();
         if (!quest) return;
 
-        const pid = Math.floor(Math.random() * 30000) + 1000;
-        
-        const applicationId = quest.config.application.id;
-        const applicationName = quest.config.application.name;
-        const questName = quest.config.messages.questName;
+        const questName = quest.config?.messages?.questName || resolveApplicationName(quest);
         const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
-        const taskName = supportedTasks.find(x => taskConfig.tasks[x] != null);
+
+        if (!taskConfig || !taskConfig.tasks) {
+            console.warn(`Пропуск квеста "${questName}": отсутствует taskConfig`);
+            doJob();
+            return;
+        }
+
+        // joinOperator "or" — пробуем задачи по порядку приоритета
+        // (видео проще всего, потом игра/стрим/активити)
+        const availableTasks = supportedTasks.filter(x => taskConfig.tasks[x] != null);
+        if (availableTasks.length === 0) {
+            console.warn(`Пропуск квеста "${questName}": нет поддерживаемой задачи`);
+            doJob();
+            return;
+        }
+        const taskName = availableTasks[0];
+
+        const applicationId = resolveApplicationId(quest, taskConfig, taskName);
+        const applicationName = resolveApplicationName(quest);
+        const pid = Math.floor(Math.random() * 30000) + 1000;
+
         const secondsNeeded = taskConfig.tasks[taskName].target;
         let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
 
@@ -80,21 +146,48 @@
                 doJob();
                 return;
             }
+            if (!applicationId) {
+                console.warn(`Пропуск квеста "${questName}": не удалось найти application.id для PLAY_ON_DESKTOP`);
+                doJob();
+                return;
+            }
             api.get({url: `/applications/public?application_ids=${applicationId}`}).then(res => {
-                const appData = res.body[0];
-                const exeName = appData.executables?.find(x => x.os === "win32")?.name?.replace(">","") ?? appData.name.replace(/[\/\\:*?"<>|]/g, "");
-                
+                const appData = res.body?.[0];
+                if (!appData) {
+                    console.warn(`Не удалось получить данные приложения для ${questName}, пропуск.`);
+                    doJob();
+                    return;
+                }
+
+                // Фолбэк: если executables нет — угадываем имя процесса
+                let exeName;
+                let hasRealExec = Array.isArray(appData.executables) && appData.executables.length > 0;
+                if (hasRealExec) {
+                    exeName = appData.executables.find(x => x.os === "win32")?.name?.replace(/^>/, "") 
+                           ?? appData.name.replace(/[\/\\:*?"<>|]/g, "");
+                } else {
+                    exeName = guessExeName(appData);
+                    console.warn(`У "${questName}" нет executables, пробуем угадать имя процесса: ${exeName}`);
+                }
+
+                if (!exeName || exeName.length < 3) {
+                    console.warn(`Не удалось определить имя процесса для "${questName}", пропуск.`);
+                    doJob();
+                    return;
+                }
+
+                const processName = exeName.replace(/\.exe$/i, "");
                 const fakeGame = {
-                    cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
+                    cmdLine: `C:\\Program Files\\${appData.name || questName}\\${exeName}`,
                     exeName,
-                    exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+                    exePath: `c:/program files/${(appData.name || questName).toLowerCase()}/${exeName}`,
                     hidden: false,
                     isLauncher: false,
                     id: applicationId,
-                    name: appData.name,
+                    name: appData.name || questName,
                     pid: pid,
                     pidPath: [pid],
-                    processName: appData.name,
+                    processName,
                     start: Date.now(),
                 };
                 const realGames = RunningGameStore.getRunningGames();
@@ -122,11 +215,20 @@
                 };
                 FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
                 
-                console.log(`Имитация игры ${applicationName}. Осталось ~${Math.ceil((secondsNeeded - secondsDone) / 60)} мин.`);
+                console.log(`Имитация игры ${applicationName} (процесс ${exeName}). Осталось ~${Math.ceil((secondsNeeded - secondsDone) / 60)} мин.`);
+                console.log("Если прогресс не растёт — Discord не принимает фейковый процесс. Тогда квест нужно выполнять реально.");
+            }).catch(err => {
+                console.error(`Ошибка при получении данных приложения для ${questName}:`, err);
+                doJob();
             });
         } else if (taskName === "STREAM_ON_DESKTOP") {
             if (!isApp) {
                 console.log("Этот тип работает только в десктопном приложении Discord для", questName);
+                doJob();
+                return;
+            }
+            if (!applicationId) {
+                console.warn(`Пропуск квеста "${questName}": не удалось найти application.id для STREAM_ON_DESKTOP`);
                 doJob();
                 return;
             }
@@ -156,6 +258,11 @@
             console.log("Нужен хотя бы 1 человек в VC!");
         } else if (taskName === "PLAY_ACTIVITY") {
             const channelId = ChannelStore.getSortedPrivateChannels()[0]?.id ?? Object.values(GuildChannelStore.getAllGuilds()).find(x => x != null && x.VOCAL.length > 0)?.VOCAL[0]?.channel.id;
+            if (!channelId) {
+                console.warn(`Пропуск квеста "${questName}": не найден голосовой канал для PLAY_ACTIVITY (зайди в любой VC).`);
+                doJob();
+                return;
+            }
             const streamKey = `call:${channelId}:1`;
             
             let fn = async () => {
@@ -182,4 +289,3 @@
     };
     doJob();
 })();
-<!-- YOLO test 🚀 -->
